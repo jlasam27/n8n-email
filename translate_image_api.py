@@ -10,7 +10,6 @@ app = Flask(__name__)
 @app.route('/translate-image', methods=['POST'])
 def translate_image():
     data = request.get_json()
-
     image_url = data.get("imageUrl")
     ocr_results = data.get("ocrResults", [])
 
@@ -19,9 +18,11 @@ def translate_image():
 
     # Use a browser-like User-Agent to avoid 403s
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/90.0.4430.93 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/90.0.4430.93 Safari/537.36"
+        ),
     }
 
     try:
@@ -56,6 +57,5 @@ def translate_image():
     return send_file(temp_file.name, mimetype='image/jpeg')
 
 if __name__ == '__main__':
-    # Replit provides the port via the PORT env var
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

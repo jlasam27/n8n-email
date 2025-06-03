@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 def _fetch_image(url):
     """
-    Fetch an image from `url` using a browser‐like User-Agent to avoid 403s.
+    Fetch an image from `url` using a browser-like User-Agent to avoid 403s.
     Returns a PIL Image in RGBA mode or raises an exception.
     """
     headers = {
@@ -25,12 +25,12 @@ def _fetch_image(url):
     img = Image.open(BytesIO(resp.content)).convert("RGBA")
     return img
 
-def _load_font(preferred_size):
+def _load_font(size):
     """
-    Attempt to load DejaVuSans-Bold or fallback to default PIL font.
+    Try to load DejaVuSans-Bold at `size`. If missing, fall back to PIL default.
     """
     try:
-        return ImageFont.truetype("DejaVuSans-Bold.ttf", size=preferred_size)
+        return ImageFont.truetype("DejaVuSans-Bold.ttf", size=size)
     except IOError:
         return ImageFont.load_default()
 
@@ -40,19 +40,18 @@ def _text_dimensions(font, text):
     Uses font.getbbox() to compute the bounding box.
     """
     bbox = font.getbbox(text)
-    width = bbox[2] - bbox[0]
-    height = bbox[3] - bbox[1]
-    return width, height
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    return w, h
 
 def _fit_text(text, box_width, box_height, font_path="DejaVuSans-Bold.ttf"):
     """
-    Return a (font, wrapped_lines) pair so that `text` fits within (box_width, box_height).
-    - Tries decreasing font sizes until it fits.
-    - Wraps text to multiple lines if necessary.
+    Find a font and line-wrapping for `text` so that it fits within (box_width, box_height).
+    Returns (font, lines) where lines is a list of wrapped strings.
+    If it cannot fit even at minimum size, it still returns the smallest font with a single line.
     """
-    # Start with a large font size, then shrink until it fits
-    # A reasonable upper bound might be box_height itself
-    font_size = box_height
+    # Start with a font size near box_height, then shrink if necessary
+    font_size = max(box_height, 12)
     if font_size < 8:
         font_size = 8
 
@@ -63,40 +62,37 @@ def _fit_text(text, box_width, box_height, font_path="DejaVuSans-Bold.ttf"):
             font = ImageFont.load_default()
             break
 
-        # Determine a rough wrap‐width in characters:
-        #   measure full text width at this font size
         full_w, full_h = _text_dimensions(font, text)
+        # If single‐line text fits exactly, we’re done
         if full_w <= box_width and full_h <= box_height:
-            # No wrapping needed
             return font, [text]
 
-        # Otherwise, try wrapping into lines.
-        # We guess a max line length based on character count and ratio:
-        approx_char_per_line = max(1, int(len(text) * box_width / (full_w + 1)))
-        lines = textwrap.wrap(text, width=approx_char_per_line)
+        # Otherwise, try wrapping into multiple lines
+        # Estimate max characters per line based on ratio
+        approx_chars = max(1, int(len(text) * box_width / (full_w + 1)))
+        lines = textwrap.wrap(text, width=approx_chars)
 
-        # Compute total height of these wrapped lines
+        # Compute total height and max line width of wrapped lines
         total_h = 0
-        max_line_w = 0
+        max_w = 0
         for line in lines:
-            w, h = _text_dimensions(font, line)
-            total_h += h + 2  # 2 pixels of line spacing
-            if w > max_line_w:
-                max_line_w = w
+            lw, lh = _text_dimensions(font, line)
+            total_h += lh + 2  # 2px line spacing
+            if lw > max_w:
+                max_w = lw
+        total_h -= 2  # remove extra spacing after last line
 
-        total_h -= 2  # remove trailing extra spacing
-        if total_h <= box_height and max_line_w <= box_width:
+        if total_h <= box_height and max_w <= box_width:
             return font, lines
 
-        # Otherwise, reduce font size and try again
         font_size -= 2
 
-    # If we exit loop, fall back to smallest font (size 8 or default)
+    # If we exit loop: use a minimum font size (8) or default
     try:
         font = ImageFont.truetype(font_path, 8)
     except IOError:
         font = ImageFont.load_default()
-    return font, textwrap.wrap(text, width=max(1, len(text)))
+    return font, [text]
 
 @app.route('/translate-image', methods=['POST'])
 def translate_image():
@@ -106,7 +102,6 @@ def translate_image():
 
     image_url = payload.get("url") or payload.get("imageUrl")
     ocr_results = payload.get("ocrResults") or payload.get("results")
-    font_size_hint = payload.get("fontSize", 20)
 
     if not image_url:
         return jsonify({"error": "Missing ‘url’ (image URL) in payload"}), 400
@@ -122,6 +117,7 @@ def translate_image():
         return jsonify({"error": f"Cannot open image: {str(e)}"}), 400
 
     draw = ImageDraw.Draw(image)
+    img_w, img_h = image.size
 
     for item in ocr_results:
         box = item.get("box", [])
@@ -131,30 +127,50 @@ def translate_image():
 
         x, y, w, h = box
 
-        # Draw a solid white rectangle over the original text area (preserves transparency)
-        rect_coords = [(x, y), (x + w, y + h)]
-        draw.rectangle(rect_coords, fill=(255, 255, 255, 255))
+        # Clamp the box to image bounds
+        x = max(0, x)
+        y = max(0, y)
+        if x >= img_w or y >= img_h:
+            # Box starts entirely outside the image
+            continue
 
-        # Fit translated text into the box
+        w = min(w, img_w - x)
+        h = min(h, img_h - y)
+        if w <= 0 or h <= 0:
+            continue
+
+        # Draw white rectangle over original text area (preserves transparency)
+        draw.rectangle([(x, y), (x + w, y + h)], fill=(255, 255, 255, 255))
+
+        # Fit translated text into the clamped box
         font, lines = _fit_text(translation, w, h, font_path="DejaVuSans-Bold.ttf")
 
-        # Compute total height of all wrapped lines
+        # Compute total height of wrapped lines
         total_h = 0
         for line in lines:
             _, lh = _text_dimensions(font, line)
             total_h += lh + 2
         total_h -= 2  # remove extra spacing after last line
 
-        # Start drawing so that text is vertically centered in the box
+        # Determine starting Y so text is vertically centered
         current_y = y + max(0, (h - total_h) // 2)
 
         for line in lines:
             lw, lh = _text_dimensions(font, line)
+            # Center horizontally within the box
             current_x = x + max(0, (w - lw) // 2)
+            # Clamp the drawn text just in case
+            if current_x + lw > img_w:
+                current_x = img_w - lw
+            if current_y + lh > img_h:
+                break
+
             draw.text((current_x, current_y), line, fill="black", font=font)
             current_y += lh + 2
+            if current_y > y + h:
+                break  # no more vertical space
 
-    # Save the modified image to a temp file, then stream it back
+    # Save to a temporary file and stream back
     temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     try:
         image.save(temp.name, format="PNG")

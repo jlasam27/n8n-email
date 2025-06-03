@@ -1,3 +1,4 @@
-flask
-pillow
+Flask
+Pillow
 requests
+gunicorn

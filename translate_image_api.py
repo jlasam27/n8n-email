@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 def _fetch_image(url):
     """
-    Fetch an image from `url` using a browser-like User-Agent to avoid 403s.
+    Fetch an image from `url` using a browser‐like User-Agent to avoid 403s.
     Returns a PIL Image in RGBA mode or raises an exception.
     """
     headers = {
@@ -30,46 +30,73 @@ def _load_font(preferred_size):
     Attempt to load DejaVuSans-Bold or fallback to default PIL font.
     """
     try:
-        # Adjust the path if you bundle a TTF with your deploy
         return ImageFont.truetype("DejaVuSans-Bold.ttf", size=preferred_size)
     except IOError:
         return ImageFont.load_default()
 
-def _fit_text(draw, text, box_width, box_height, font_path="DejaVuSans-Bold.ttf"):
+def _text_dimensions(font, text):
     """
-    Return a PIL font object sized so that `text` fits within (box_width, box_height).
-    If necessary, wrap to multiple lines. Returns (font, wrapped_lines).
+    Given a FreeTypeFont `font` and a string `text`, return (width, height).
+    Uses font.getbbox() to compute the bounding box.
     """
-    # Start with a large font size, then shrink until it fits.
-    max_font_size = min(box_height, box_width // max(1, len(text))) * 2
-    font_size = max_font_size
+    bbox = font.getbbox(text)
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    return width, height
 
-    # Load a PIL ImageFont (we'll shrink if needed)
-    try:
-        font = ImageFont.truetype(font_path, size=font_size)
-    except IOError:
-        font = ImageFont.load_default()
-        return font, [text]
+def _fit_text(text, box_width, box_height, font_path="DejaVuSans-Bold.ttf"):
+    """
+    Return a (font, wrapped_lines) pair so that `text` fits within (box_width, box_height).
+    - Tries decreasing font sizes until it fits.
+    - Wraps text to multiple lines if necessary.
+    """
+    # Start with a large font size, then shrink until it fits
+    # A reasonable upper bound might be box_height itself
+    font_size = box_height
+    if font_size < 8:
+        font_size = 8
 
-    # Determine wrapping width roughly by character count
-    # We'll adjust via binary search-like loop
-    while font_size > 8:  # don't go below size 8
-        font = ImageFont.truetype(font_path, font_size)
-        # Wrap text so that line width <= box_width
-        lines = textwrap.wrap(text, width=max(1, int(len(text) * box_width / (font.getsize(text)[0] + 1))))
-        # Compute total text height
-        total_h = sum(font.getsize(line)[1] for line in lines) + (len(lines)-1) * 2
-        max_line_w = max((font.getsize(line)[0] for line in lines), default=0)
+    while font_size >= 8:
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except IOError:
+            font = ImageFont.load_default()
+            break
+
+        # Determine a rough wrap‐width in characters:
+        #   measure full text width at this font size
+        full_w, full_h = _text_dimensions(font, text)
+        if full_w <= box_width and full_h <= box_height:
+            # No wrapping needed
+            return font, [text]
+
+        # Otherwise, try wrapping into lines.
+        # We guess a max line length based on character count and ratio:
+        approx_char_per_line = max(1, int(len(text) * box_width / (full_w + 1)))
+        lines = textwrap.wrap(text, width=approx_char_per_line)
+
+        # Compute total height of these wrapped lines
+        total_h = 0
+        max_line_w = 0
+        for line in lines:
+            w, h = _text_dimensions(font, line)
+            total_h += h + 2  # 2 pixels of line spacing
+            if w > max_line_w:
+                max_line_w = w
+
+        total_h -= 2  # remove trailing extra spacing
         if total_h <= box_height and max_line_w <= box_width:
             return font, lines
+
+        # Otherwise, reduce font size and try again
         font_size -= 2
 
-    # If nothing fits well, return the smallest font and unwrapped text
+    # If we exit loop, fall back to smallest font (size 8 or default)
     try:
         font = ImageFont.truetype(font_path, 8)
     except IOError:
         font = ImageFont.load_default()
-    return font, [text]
+    return font, textwrap.wrap(text, width=max(1, len(text)))
 
 @app.route('/translate-image', methods=['POST'])
 def translate_image():
@@ -96,7 +123,6 @@ def translate_image():
 
     draw = ImageDraw.Draw(image)
 
-    # For each OCR block, draw a filled rectangle and the translated text inside
     for item in ocr_results:
         box = item.get("box", [])
         translation = item.get("translation", "") or item.get("text", "")
@@ -104,25 +130,31 @@ def translate_image():
             continue
 
         x, y, w, h = box
+
         # Draw a solid white rectangle over the original text area (preserves transparency)
         rect_coords = [(x, y), (x + w, y + h)]
         draw.rectangle(rect_coords, fill=(255, 255, 255, 255))
 
         # Fit translated text into the box
-        font, lines = _fit_text(draw, translation, w, h, font_path="DejaVuSans-Bold.ttf")
+        font, lines = _fit_text(translation, w, h, font_path="DejaVuSans-Bold.ttf")
 
-        # Compute vertical offset so text is centered
-        total_text_height = sum(font.getsize(line)[1] for line in lines) + (len(lines) - 1) * 2
-        current_y = y + max(0, (h - total_text_height) // 2)
+        # Compute total height of all wrapped lines
+        total_h = 0
+        for line in lines:
+            _, lh = _text_dimensions(font, line)
+            total_h += lh + 2
+        total_h -= 2  # remove extra spacing after last line
+
+        # Start drawing so that text is vertically centered in the box
+        current_y = y + max(0, (h - total_h) // 2)
 
         for line in lines:
-            line_w, line_h = font.getsize(line)
-            # Center horizontally
-            current_x = x + max(0, (w - line_w) // 2)
+            lw, lh = _text_dimensions(font, line)
+            current_x = x + max(0, (w - lw) // 2)
             draw.text((current_x, current_y), line, fill="black", font=font)
-            current_y += line_h + 2
+            current_y += lh + 2
 
-    # Write to a temporary file, then stream it back
+    # Save the modified image to a temp file, then stream it back
     temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
     try:
         image.save(temp.name, format="PNG")
@@ -144,5 +176,4 @@ def translate_image():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    # In production, you’d want to disable debug=True
     app.run(host="0.0.0.0", port=port, debug=False)

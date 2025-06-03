@@ -14,11 +14,11 @@ def translate_image():
     image_url = data.get("imageUrl")
     ocr_results = data.get("ocrResults", [])
 
-    # Validate inputs:
+    # 0) Validate inputs
     if not image_url or not isinstance(ocr_results, list):
         return jsonify({"error": "Missing or invalid imageUrl/ocrResults"}), 400
 
-    # Use a browser‐like User-Agent to avoid 403 “Forbidden”
+    # 1) Fetch the image
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -26,8 +26,6 @@ def translate_image():
             "Chrome/90.0.4430.93 Safari/537.36"
         ),
     }
-
-    # 1) Fetch the image from image_url
     try:
         resp = requests.get(image_url, headers=headers, timeout=10)
         resp.raise_for_status()
@@ -41,14 +39,13 @@ def translate_image():
 
     draw = ImageDraw.Draw(image)
 
-    # 2) Load a TTF font. We’ll start at size=24 and shrink from there.
-    #    If DejaVuSans-Bold.ttf is unavailable, we fall back to a PIL default.
+    # 2) Load a TTF font (fallback to default)
     try:
         base_font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=24)
     except Exception:
         base_font = ImageFont.load_default()
 
-    # 3) Process each OCR block one by one:
+    # 3) Process each OCR block
     for item in ocr_results:
         raw_box = item.get("box", [])
         translation = item.get("translation", "").strip()
@@ -57,33 +54,38 @@ def translate_image():
 
         x, y, w, h = raw_box
 
-        # 3a) Add a small padding (2px on all sides) so we cover cleanly:
+        # Skip any invalid or zero‐area boxes
+        if w <= 0 or h <= 0:
+            continue
+
+        # 3a) Compute padded “cover” coordinates, then clamp/normalize
         PAD = 2
-        cover_left   = max(0, x - PAD)
-        cover_top    = max(0, y - PAD)
-        cover_right  = min(image.width, x + w + PAD)
-        cover_bottom = min(image.height, y + h + PAD)
+        left   = max(0, x - PAD)
+        top    = max(0, y - PAD)
+        right  = min(image.width, x + w + PAD)
+        bottom = min(image.height, y + h + PAD)
 
-        draw.rectangle(
-            [cover_left, cover_top, cover_right, cover_bottom],
-            fill="white"
-        )
+        # Ensure top <= bottom and left <= right
+        if bottom < top:
+            bottom = top
+        if right < left:
+            right = left
 
-        # 3b) Wrap & shrink logic:
-        #    Start with the base font size, shrink until everything truly fits.
-        #    Minimum font size is 6px.
+        # Draw white rectangle to cover Japanese text
+        draw.rectangle([left, top, right, bottom], fill="white")
+
+        # 3b) Wrap & shrink logic
         try:
             current_size = base_font.size
         except AttributeError:
-            # If load_default() was used, assume starting size = 24
             current_size = 24
         current_font = base_font
 
+        # Start with a single line; we’ll re-wrap if needed
         wrapped_lines = [translation]
 
         while True:
-            # Measure each wrapped line’s pixel width via getbbox()
-            # and confirm they fit within the box width.
+            # Measure width/height of every wrapped line
             all_fit = True
             line_heights = []
             total_text_height = 0
@@ -98,28 +100,25 @@ def translate_image():
                     all_fit = False
                 total_text_height += text_h
 
-            # Add 4px between each line
+            # Add 4px of spacing between lines
             total_text_height += max(0, (len(wrapped_lines) - 1) * 4)
 
-            # If height doesn’t fit, or any line’s width > w, shrink font (if possible)
+            # If any line is too wide or total height exceeds box,
+            # shrink font (down to 6px minimum) and re-wrap text
             if (not all_fit or total_text_height > h) and current_size > 6:
                 current_size -= 2
                 try:
-                    current_font = ImageFont.truetype(
-                        "DejaVuSans-Bold.ttf", size=current_size
-                    )
+                    current_font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=current_size)
                 except Exception:
                     current_font = ImageFont.load_default()
-                    break  # can’t shrink further
+                    break
 
-                # Recompute a conservative “chars per line” bound:
-                #  Measure a Japanese character (“あ”) and an English sample (“Street”) for safety
+                # Estimate a “chars per line” limit, conservatively
                 try:
                     jp_bbox = current_font.getbbox("あ")
                     jp_w = jp_bbox[2] - jp_bbox[0]
                 except Exception:
                     jp_w = 12
-
                 try:
                     sample_bbox = current_font.getbbox("Street")
                     en_w = (sample_bbox[2] - sample_bbox[0]) // 6
@@ -129,16 +128,13 @@ def translate_image():
                 avg_char_width = max(jp_w, en_w, 8)
                 chars_per_line = max(1, w // avg_char_width)
 
-                wrapped_lines = textwrap.TextWrapper(
-                    width=chars_per_line
-                ).wrap(translation)
+                wrapped_lines = textwrap.TextWrapper(width=chars_per_line).wrap(translation)
                 continue
             else:
-                # Everything fits (or we reached minimum font size)
+                # Everything fits (or we reached minimum size)
                 break
 
-        # 3c) Now draw each wrapped line, centered inside the box:
-        #     Compute final total height and begin vertically centered.
+        # 3c) Vertically center the wrapped text inside the original box
         total_text_height = sum(line_heights) + max(0, (len(wrapped_lines) - 1) * 4)
         y_offset = y + (h - total_text_height) // 2
 
@@ -147,13 +143,13 @@ def translate_image():
             text_w = bbox[2] - bbox[0]
             text_h = bbox[3] - bbox[1]
 
-            # Center horizontally:
+            # Center horizontally inside the original box
             text_x = x + (w - text_w) // 2
 
             draw.text((text_x, y_offset), line, fill="black", font=current_font)
             y_offset += text_h + 4  # 4px line spacing
 
-    # 4) Save the result to a temporary JPEG and return it
+    # 4) Save to a temp file and return it
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
     image.save(tmp.name, format="JPEG")
     tmp.seek(0)

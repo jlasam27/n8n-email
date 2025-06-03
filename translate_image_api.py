@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file, jsonify, after_this_request
+from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw, ImageFont
 import requests
 from io import BytesIO
@@ -8,11 +8,16 @@ import textwrap
 
 app = Flask(__name__)
 
-def _fetch_image(url):
-    """
-    Fetch an image from `url` using a browser-like User-Agent to avoid 403s.
-    Returns a PIL Image in RGBA mode or raises an exception.
-    """
+@app.route('/translate-image', methods=['POST'])
+def translate_image():
+    data = request.get_json(force=True)  # force=True ensures JSON parse even if no mimetype
+    image_url = data.get("imageUrl")
+    ocr_results = data.get("ocrResults", [])
+
+    if not image_url or not isinstance(ocr_results, list):
+        return jsonify({"error": "Missing or invalid imageUrl/ocrResults"}), 400
+
+    # Use a browser‐like User‐Agent to avoid 403s
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -20,176 +25,119 @@ def _fetch_image(url):
             "Chrome/90.0.4430.93 Safari/537.36"
         ),
     }
-    resp = requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    img = Image.open(BytesIO(resp.content)).convert("RGBA")
-    return img
 
-def _load_font(size):
-    """
-    Try to load DejaVuSans-Bold at `size`. If missing, fall back to PIL default.
-    """
+    # 1. Fetch the image
     try:
-        return ImageFont.truetype("DejaVuSans-Bold.ttf", size=size)
-    except IOError:
-        return ImageFont.load_default()
-
-def _text_dimensions(font, text):
-    """
-    Given a FreeTypeFont `font` and a string `text`, return (width, height).
-    Uses font.getbbox() to compute the bounding box.
-    """
-    bbox = font.getbbox(text)
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
-    return w, h
-
-def _fit_text(text, box_width, box_height, font_path="DejaVuSans-Bold.ttf"):
-    """
-    Find a font and line-wrapping for `text` so that it fits within (box_width, box_height).
-    Returns (font, lines) where lines is a list of wrapped strings.
-    If it cannot fit even at minimum size, it still returns the smallest font with a single line.
-    """
-    # Start with a font size near box_height, then shrink if necessary
-    font_size = max(box_height, 12)
-    if font_size < 8:
-        font_size = 8
-
-    while font_size >= 8:
-        try:
-            font = ImageFont.truetype(font_path, font_size)
-        except IOError:
-            font = ImageFont.load_default()
-            break
-
-        full_w, full_h = _text_dimensions(font, text)
-        # If single‐line text fits exactly, we’re done
-        if full_w <= box_width and full_h <= box_height:
-            return font, [text]
-
-        # Otherwise, try wrapping into multiple lines
-        # Estimate max characters per line based on ratio
-        approx_chars = max(1, int(len(text) * box_width / (full_w + 1)))
-        lines = textwrap.wrap(text, width=approx_chars)
-
-        # Compute total height and max line width of wrapped lines
-        total_h = 0
-        max_w = 0
-        for line in lines:
-            lw, lh = _text_dimensions(font, line)
-            total_h += lh + 2  # 2px line spacing
-            if lw > max_w:
-                max_w = lw
-        total_h -= 2  # remove extra spacing after last line
-
-        if total_h <= box_height and max_w <= box_width:
-            return font, lines
-
-        font_size -= 2
-
-    # If we exit loop: use a minimum font size (8) or default
-    try:
-        font = ImageFont.truetype(font_path, 8)
-    except IOError:
-        font = ImageFont.load_default()
-    return font, [text]
-
-@app.route('/translate-image', methods=['POST'])
-def translate_image():
-    payload = request.get_json(silent=True)
-    if not payload:
-        return jsonify({"error": "Invalid JSON payload"}), 400
-
-    image_url = payload.get("url") or payload.get("imageUrl")
-    ocr_results = payload.get("ocrResults") or payload.get("results")
-
-    if not image_url:
-        return jsonify({"error": "Missing ‘url’ (image URL) in payload"}), 400
-    if ocr_results is None:
-        return jsonify({"error": "Missing ‘ocrResults’ (array) in payload"}), 400
-
-    # Fetch and open the image
-    try:
-        image = _fetch_image(image_url)
+        resp = requests.get(image_url, headers=headers, timeout=10)
+        resp.raise_for_status()
     except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Failed to fetch image: {str(e)}"}), 400
+        return jsonify({"error": f"Failed to fetch image: {e}"}), 400
+
+    # 2. Open and convert the image
+    try:
+        image = Image.open(BytesIO(resp.content)).convert("RGB")
     except Exception as e:
-        return jsonify({"error": f"Cannot open image: {str(e)}"}), 400
+        return jsonify({"error": f"Cannot open image: {e}"}), 400
 
     draw = ImageDraw.Draw(image)
-    img_w, img_h = image.size
+
+    # 3. Load a default TrueType font
+    try:
+        # DejaVuSans‐Bold.ttf comes bundled with many Linux distros
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=24)
+    except IOError:
+        font = ImageFont.load_default()  # fallback
 
     for item in ocr_results:
         box = item.get("box", [])
-        translation = item.get("translation", "") or item.get("text", "")
-        if not (isinstance(box, (list, tuple)) and len(box) == 4):
+        translation = item.get("translation", "") or ""
+        # We only proceed if box is a 4‐element list and translation is nonempty
+        if not (isinstance(box, list) and len(box) == 4) or not translation.strip():
             continue
 
         x, y, w, h = box
 
-        # Clamp the box to image bounds
-        x = max(0, x)
-        y = max(0, y)
-        if x >= img_w or y >= img_h:
-            # Box starts entirely outside the image
-            continue
+        # 4. Prepare to wrap or shrink text
+        # We will try wrapping the text into multiple lines to fit width w.
+        # If wrapping to a minimal single‐character width still overflows the box height,
+        # we gradually reduce font size.
 
-        w = min(w, img_w - x)
-        h = min(h, img_h - y)
-        if w <= 0 or h <= 0:
-            continue
+        # Start with initial font size
+        current_font_size = font.size if hasattr(font, "size") else 24
+        current_font = font
+        lines = [translation]
 
-        # Draw white rectangle over original text area (preserves transparency)
-        draw.rectangle([(x, y), (x + w, y + h)], fill=(255, 255, 255, 255))
+        while True:
+            # 5. Attempt to wrap text at the current font size so that each line <= w
+            wrapper = textwrap.TextWrapper(width=9999)  # large initial width
+            # Compute average character width to estimate wrap width
+            # Use getbbox on a representative char, e.g. "あ"
+            try:
+                char_bbox = current_font.getbbox("あ")
+                avg_char_width = char_bbox[2] - char_bbox[0]
+                # If avg_char_width is zero (edge case), fallback to 10px
+                avg_char_width = avg_char_width if avg_char_width > 0 else 10
+            except Exception:
+                avg_char_width = 10
 
-        # Fit translated text into the clamped box
-        font, lines = _fit_text(translation, w, h, font_path="DejaVuSans-Bold.ttf")
+            # Compute how many chars can fit in the box width
+            max_chars_per_line = max(1, w // avg_char_width)
+            wrapper.width = max_chars_per_line
 
-        # Compute total height of wrapped lines
-        total_h = 0
-        for line in lines:
-            _, lh = _text_dimensions(font, line)
-            total_h += lh + 2
-        total_h -= 2  # remove extra spacing after last line
+            lines = wrapper.wrap(translation)
 
-        # Determine starting Y so text is vertically centered
-        current_y = y + max(0, (h - total_h) // 2)
+            # 6. Measure total height with small line spacing (say 4px)
+            total_height = 0
+            line_heights = []
+            for line in lines:
+                # getbbox returns (x0, y0, x1, y1)
+                bbox = current_font.getbbox(line)
+                line_height = bbox[3] - bbox[1]
+                line_heights.append(line_height)
+                total_height += line_height
+            # Add spacing: assume 4px between lines
+            total_height += (len(lines) - 1) * 4
 
-        for line in lines:
-            lw, lh = _text_dimensions(font, line)
-            # Center horizontally within the box
-            current_x = x + max(0, (w - lw) // 2)
-            # Clamp the drawn text just in case
-            if current_x + lw > img_w:
-                current_x = img_w - lw
-            if current_y + lh > img_h:
+            # 7. If the wrapped text fits within height h, break; else shrink font
+            if total_height <= h or current_font_size <= 10:
                 break
+            # Otherwise, reduce font size by 2 and retry
+            current_font_size -= 2
+            try:
+                current_font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=current_font_size)
+            except IOError:
+                current_font = ImageFont.load_default()
+                break  # can't shrink default builtin font
 
-            draw.text((current_x, current_y), line, fill="black", font=font)
-            current_y += lh + 2
-            if current_y > y + h:
-                break  # no more vertical space
+        # 8. Draw a filled rectangle to cover the original Japanese
+        #    We want to cover (x, y) to (x + w, y + h).
+        draw.rectangle([x, y, x + w, y + h], fill="white")
 
-    # Save to a temporary file and stream back
-    temp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    try:
-        image.save(temp.name, format="PNG")
-    except Exception as e:
-        temp.close()
-        os.unlink(temp.name)
-        return jsonify({"error": f"Failed to save modified image: {str(e)}"}), 500
+        # 9. Render each line, centering it vertically within the box
+        current_y = y
+        # Compute remaining vertical space to center text block
+        leftover_space = h - total_height
+        current_y += max(0, leftover_space // 2)
 
-    @after_this_request
-    def cleanup(response):
-        try:
-            os.unlink(temp.name)
-        except Exception:
-            pass
-        return response
+        for idx, line in enumerate(lines):
+            # measure width to center horizontally
+            bbox = current_font.getbbox(line)
+            line_width = bbox[2] - bbox[0]
+            line_height = bbox[3] - bbox[1]
+            # Center line within box horizontally
+            text_x = x + max(0, (w - line_width) // 2)
+            text_y = current_y
+            draw.text((text_x, text_y), line, fill="black", font=current_font)
+            # Advance y
+            current_y += line_height + 4
 
-    return send_file(temp.name, mimetype='image/png')
+    # 10. Save to a temporary file and return
+    temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    image.save(temp_file.name, format="JPEG", quality=90)
+    temp_file.seek(0)
+    return send_file(temp_file.name, mimetype='image/jpeg')
 
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)

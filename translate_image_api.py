@@ -1,161 +1,177 @@
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, abort
 from PIL import Image, ImageDraw, ImageFont
 import requests
 from io import BytesIO
-import tempfile
-import os
-import textwrap
 
 app = Flask(__name__)
 
-@app.route('/translate-image', methods=['POST'])
-def translate_image():
+@app.route('/overlay', methods=['POST'])
+def overlay_text():
     data = request.get_json()
-    image_url = data.get("imageUrl")
-    ocr_results = data.get("ocrResults", [])
+    if not data or 'imageUrl' not in data or 'ocrResults' not in data:
+        abort(400, 'Invalid input JSON: must contain imageUrl and ocrResults')
 
-    # 0) Validate inputs
-    if not image_url or not isinstance(ocr_results, list):
-        return jsonify({"error": "Missing or invalid imageUrl/ocrResults"}), 400
+    image_url = data['imageUrl']
+    ocr_results = data['ocrResults']
 
     # 1) Fetch the image
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/90.0.4430.93 Safari/537.36"
-        ),
-    }
     try:
-        resp = requests.get(image_url, headers=headers, timeout=10)
+        resp = requests.get(image_url, timeout=10)
         resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Failed to fetch image: {e}"}), 400
+    except Exception as e:
+        abort(400, f'Error fetching image: {e}')
 
     try:
-        image = Image.open(BytesIO(resp.content)).convert("RGB")
+        image = Image.open(BytesIO(resp.content)).convert('RGB')
     except Exception as e:
-        return jsonify({"error": f"Cannot open image: {e}"}), 400
+        abort(400, f'Invalid image data: {e}')
 
     draw = ImageDraw.Draw(image)
+    img_w, img_h = image.width, image.height
 
-    # 2) Load a TTF font (fallback to default)
-    try:
-        base_font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=24)
-    except Exception:
-        base_font = ImageFont.load_default()
+    # 2) Prepare font path and minimum size
+    #    Adjust "arial.ttf" to a valid TTF on your system, or bundle DejaVuSans-Bold.ttf, etc.
+    font_path = 'arial.ttf'
+    min_font_size = 14
 
-    # 3) Process each OCR block
+    def get_text_bbox(text, font):
+        """
+        Return (left, top, right, bottom) for the given text using the given font.
+        Handles multiline text with newline characters.
+        """
+        return draw.multiline_textbbox((0, 0), text, font=font)
+
+    def wrap_text_to_width(text, font, max_width):
+        """
+        Wrap text into multiple lines so that each line does not exceed max_width in pixels.
+        Uses font.getbbox() to measure each candidate line.
+        """
+        words = text.split()
+        if not words:
+            return []
+
+        lines = []
+        current = words[0]
+
+        for word in words[1:]:
+            candidate = current + " " + word
+            bbox = font.getbbox(candidate)
+            w = bbox[2] - bbox[0]
+            if w <= max_width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    # 3) Iterate over OCR results
     for item in ocr_results:
-        raw_box = item.get("box", [])
-        translation = item.get("translation", "").strip()
-        if not translation or not (isinstance(raw_box, list) and len(raw_box) == 4):
+        text = item.get('translatedText') or item.get('text') or ''
+        if not text.strip():
             continue
 
-        x, y, w, h = raw_box
+        # Extract bounding box
+        box = item.get('boundingBox') or item.get('bbox') or item.get('box')
+        if not box:
+            continue
 
-        # Skip any invalid or zero‐area boxes
+        # Normalize box format
+        if isinstance(box, dict):
+            x = int(box.get('left', box.get('x', 0)))
+            y = int(box.get('top', box.get('y', 0)))
+            w = int(box.get('width', box.get('w', 0)))
+            h = int(box.get('height', box.get('h', 0)))
+        elif isinstance(box, (list, tuple)) and len(box) >= 4:
+            x, y, w, h = map(int, box[:4])
+        else:
+            continue
+
+        # Clamp box to image boundaries
+        if x < 0:
+            x = 0
+        if y < 0:
+            y = 0
+        if x + w > img_w:
+            w = img_w - x
+        if y + h > img_h:
+            h = img_h - y
         if w <= 0 or h <= 0:
             continue
 
-        # 3a) Compute padded “cover” coordinates, then clamp/normalize
-        PAD = 2
-        left   = max(0, x - PAD)
-        top    = max(0, y - PAD)
-        right  = min(image.width, x + w + PAD)
-        bottom = min(image.height, y + h + PAD)
-
-        # Ensure top <= bottom and left <= right
-        if bottom < top:
-            bottom = top
-        if right < left:
-            right = left
-
-        # Draw white rectangle to cover Japanese text
-        draw.rectangle([left, top, right, bottom], fill="white")
-
-        # 3b) Wrap & shrink logic
+        # 3a) Start with the largest font that won't exceed image height (and ≥ min_font_size)
+        font_size = max(min_font_size, h)
         try:
-            current_size = base_font.size
-        except AttributeError:
-            current_size = 24
-        current_font = base_font
+            font = ImageFont.truetype(font_path, font_size)
+        except OSError:
+            font = ImageFont.load_default()
+            font_size = min_font_size  # fallback
 
-        # Start with a single line; we’ll re-wrap if needed
-        wrapped_lines = [translation]
-
+        # 3b) Wrap text and shrink font until it fits width
+        lines = wrap_text_to_width(text, font, w)
         while True:
-            # Measure width/height of every wrapped line
-            all_fit = True
-            line_heights = []
-            total_text_height = 0
-
-            for line in wrapped_lines:
-                bbox = current_font.getbbox(line)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
-                line_heights.append(text_h)
-
-                if text_w > w:
-                    all_fit = False
-                total_text_height += text_h
-
-            # Add 4px of spacing between lines
-            total_text_height += max(0, (len(wrapped_lines) - 1) * 4)
-
-            # If any line is too wide or total height exceeds box,
-            # shrink font (down to 6px minimum) and re-wrap text
-            if (not all_fit or total_text_height > h) and current_size > 6:
-                current_size -= 2
-                try:
-                    current_font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=current_size)
-                except Exception:
-                    current_font = ImageFont.load_default()
+            # After wrapping, check if any line is too wide
+            too_wide = False
+            for ln in lines:
+                bbox = font.getbbox(ln)
+                line_w = bbox[2] - bbox[0]
+                if line_w > w:
+                    too_wide = True
                     break
 
-                # Estimate a “chars per line” limit, conservatively
-                try:
-                    jp_bbox = current_font.getbbox("あ")
-                    jp_w = jp_bbox[2] - jp_bbox[0]
-                except Exception:
-                    jp_w = 12
-                try:
-                    sample_bbox = current_font.getbbox("Street")
-                    en_w = (sample_bbox[2] - sample_bbox[0]) // 6
-                except Exception:
-                    en_w = jp_w
+            # Compute total text height for these lines
+            ascent, descent = font.getmetrics()
+            line_height = ascent + descent
+            total_text_height = line_height * len(lines)
 
-                avg_char_width = max(jp_w, en_w, 8)
-                chars_per_line = max(1, w // avg_char_width)
-
-                wrapped_lines = textwrap.TextWrapper(width=chars_per_line).wrap(translation)
+            if (too_wide or total_text_height > h) and font_size > min_font_size:
+                font_size -= 1
+                try:
+                    font = ImageFont.truetype(font_path, font_size)
+                except OSError:
+                    font = ImageFont.load_default()
+                    break
+                lines = wrap_text_to_width(text, font, w)
                 continue
             else:
-                # Everything fits (or we reached minimum size)
                 break
 
-        # 3c) Vertically center the wrapped text inside the original box
-        total_text_height = sum(line_heights) + max(0, (len(wrapped_lines) - 1) * 4)
-        y_offset = y + (h - total_text_height) // 2
+        # 3c) Recompute total text height (with final font)
+        ascent, descent = font.getmetrics()
+        line_height = ascent + descent
+        total_text_height = line_height * len(lines)
 
-        for idx, line in enumerate(wrapped_lines):
-            bbox = current_font.getbbox(line)
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
+        # If height still exceeds box, expand box downward (clamped to image)
+        if total_text_height > h:
+            new_h = total_text_height
+            if y + new_h > img_h:
+                new_h = img_h - y
+            h = new_h
 
-            # Center horizontally inside the original box
-            text_x = x + (w - text_w) // 2
+        # 3d) Build multiline text string
+        text_block = "\n".join(lines)
 
-            draw.text((text_x, y_offset), line, fill="black", font=current_font)
-            y_offset += text_h + 4  # 4px line spacing
+        # 3e) Compute exact text bounding box at (x, y)
+        text_bbox = draw.multiline_textbbox((x, y), text_block, font=font)
+        tb_left, tb_top, tb_right, tb_bottom = text_bbox
 
-    # 4) Save to a temp file and return it
-    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    image.save(tmp.name, format="JPEG")
-    tmp.seek(0)
-    return send_file(tmp.name, mimetype="image/jpeg")
+        # 3f) Draw white padded rectangle behind the text
+        padding = 4
+        rect_left = max(tb_left - padding, 0)
+        rect_top = max(tb_top - padding, 0)
+        rect_right = min(tb_right + padding, img_w)
+        rect_bottom = min(tb_bottom + padding, img_h)
+        draw.rectangle([rect_left, rect_top, rect_right, rect_bottom], fill='white')
+
+        # 3g) Draw the text itself (black color)
+        draw.multiline_text((x, y), text_block, fill='black', font=font)
+
+    # 4) Return the modified image in-memory
+    img_buffer = BytesIO()
+    image.save(img_buffer, format='PNG')
+    img_buffer.seek(0)
+    return send_file(img_buffer, mimetype='image/png')
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True)

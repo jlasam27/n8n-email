@@ -1,20 +1,24 @@
-from flask import Flask, request, send_file, abort
+from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw, ImageFont
 import requests
 from io import BytesIO
+import tempfile
+import os
+import textwrap
 
 app = Flask(__name__)
 
-@app.route('/overlay', methods=['POST'])
-def overlay_text():
+@app.route('/translate-image', methods=['POST'])
+def translate_image():
     data = request.get_json()
-    if not data or 'imageUrl' not in data or 'ocrResults' not in data:
-        abort(400, 'Invalid input JSON: must contain imageUrl and ocrResults')
+    image_url = data.get("imageUrl")
+    ocr_results = data.get("ocrResults", [])
 
-    image_url = data['imageUrl']
-    ocr_results = data['ocrResults']
+    # 0) Validate inputs
+    if not image_url or not isinstance(ocr_results, list):
+        return jsonify({"error": "Missing or invalid imageUrl/ocrResults"}), 400
 
-    # 1) Fetch the image with a browser‐like User-Agent header
+    # 1) Fetch the image (with a browser-like User-Agent to avoid 403)
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,146 +27,156 @@ def overlay_text():
         ),
     }
     try:
-        resp = requests.get(image_url, headers=headers, timeout=10)
+        resp = requests.get(image_url, headers=headers, stream=True, timeout=10)
         resp.raise_for_status()
+        image = Image.open(resp.raw).convert("RGB")
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Failed to fetch image: {e}"}), 400
     except Exception as e:
-        abort(400, f'Error fetching image: {e}')
-
-    try:
-        image = Image.open(BytesIO(resp.content)).convert('RGB')
-    except Exception as e:
-        abort(400, f'Invalid image data: {e}')
+        return jsonify({"error": f"Cannot open image: {e}"}), 400
 
     draw = ImageDraw.Draw(image)
-    img_w, img_h = image.width, image.height
+    img_w, img_h = image.size
 
-    # 2) Prepare font path and minimum size
-    font_path = 'arial.ttf'  # adjust if needed
-    min_font_size = 14
+    # 2) Load a TTF font (fallback to default)
+    try:
+        base_font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=24)
+    except Exception:
+        base_font = ImageFont.load_default()
 
-    def wrap_text_to_width(text, font, max_width):
-        """
-        Wrap `text` into multiple lines so that each line does not exceed max_width in pixels.
-        """
-        words = text.split()
-        if not words:
-            return []
-
-        lines = []
-        current = words[0]
-        for word in words[1:]:
-            candidate = current + " " + word
-            bbox = font.getbbox(candidate)
-            w = bbox[2] - bbox[0]
-            if w <= max_width:
-                current = candidate
-            else:
-                lines.append(current)
-                current = word
-        lines.append(current)
-        return lines
-
-    # 3) Iterate over each OCR entry
+    # 3) For each OCR block, erase and draw the translation
     for item in ocr_results:
-        text = item.get('translation') or item.get('text') or ''
-        text = text.strip()
-        if not text:
+        raw_box = item.get("box", [])
+        translation = item.get("translation", "").strip()
+        if not translation or not (isinstance(raw_box, list) and len(raw_box) == 4):
             continue
 
-        # 3a) Extract/normalize bounding box
-        box = item.get('boundingBox') or item.get('bbox') or item.get('box')
-        if not box:
+        x0, y0, w0, h0 = raw_box
+        if w0 <= 0 or h0 <= 0:
             continue
 
-        if isinstance(box, dict):
-            x = int(box.get('left', 0))
-            y = int(box.get('top', 0))
-            w = int(box.get('width', 0))
-            h = int(box.get('height', 0))
-        elif isinstance(box, (list, tuple)) and len(box) >= 4:
-            x, y, w, h = map(int, box[:4])
-        else:
-            continue
+        # 3a) Compute padded “erase” rectangle
+        PAD = 2
+        left = max(0, x0 - PAD)
+        top = max(0, y0 - PAD)
+        right = min(img_w, x0 + w0 + PAD)
+        bottom = min(img_h, y0 + h0 + PAD)
+        if bottom < top:
+            bottom = top
+        if right < left:
+            right = left
 
-        # Clamp within image
-        if x < 0: x = 0
-        if y < 0: y = 0
-        if x + w > img_w:
-            w = img_w - x
-        if y + h > img_h:
-            h = img_h - y
-        if w <= 0 or h <= 0:
-            continue
+        # Draw a white rectangle to cover the original text
+        draw.rectangle([left, top, right, bottom], fill="white")
 
-        # 3b) Start with a large font (but at least min_font_size)
-        font_size = max(min_font_size, h)
-        try:
-            font = ImageFont.truetype(font_path, font_size)
-        except OSError:
-            font = ImageFont.load_default()
-            font_size = min_font_size
+        # 3b) Determine font size & wrapping so text fits
+        # Start with base font size, then shrink or expand box if needed
+        font_size = getattr(base_font, "size", 24)
+        current_font = base_font
 
-        # 3c) Wrap & shrink until both width/height fit
-        lines = wrap_text_to_width(text, font, w)
+        # Helper to measure a line of text
+        def measure_text(text, font):
+            """Return (width, height) of the given text with this font."""
+            bbox = font.getbbox(text)
+            return (bbox[2] - bbox[0], bbox[3] - bbox[1])
+
+        # Wrap text into lines given a font and box width
+        def wrap_text_to_width(text, font, max_width):
+            """Return a list of lines wrapped so that each line's pixel width ≤ max_width."""
+            words = text.split()
+            if not words:
+                return []
+            lines = []
+            current_line = words[0]
+            for word in words[1:]:
+                test_line = current_line + " " + word
+                line_w, _ = measure_text(test_line, font)
+                if line_w <= max_width:
+                    current_line = test_line
+                else:
+                    lines.append(current_line)
+                    current_line = word
+            lines.append(current_line)
+            return lines
+
+        # Attempt to fit text within (w0, h0). If too large, shrink font down to min 6.
+        # If still too big, expand box dimensions up to image boundaries.
+        MIN_FONT = 6
+        FONT_STEP = 2
+
         while True:
-            # Check if any line is too wide
-            too_wide = False
-            for ln in lines:
-                bbox = font.getbbox(ln)
-                line_w = bbox[2] - bbox[0]
-                if line_w > w:
-                    too_wide = True
-                    break
+            # Wrap at current font and original box width
+            lines = wrap_text_to_width(translation, current_font, w0)
+            # Measure each line, accumulate total height
+            line_widths = []
+            line_heights = []
+            total_height = 0
+            for line in lines:
+                lw, lh = measure_text(line, current_font)
+                line_widths.append(lw)
+                line_heights.append(lh)
+                total_height += lh
+            # Add 4px spacing between lines
+            total_height += max(0, (len(lines) - 1) * 4)
 
-            # Compute total height
-            ascent, descent = font.getmetrics()
-            line_height = ascent + descent
-            total_text_height = line_height * len(lines)
-
-            if (too_wide or total_text_height > h) and font_size > min_font_size:
-                font_size -= 1
+            # If any line exceeds w0, or total height exceeds h0, try shrinking font
+            if (lines and (max(line_widths) > w0 or total_height > h0)) and font_size > MIN_FONT:
+                font_size = max(MIN_FONT, font_size - FONT_STEP)
                 try:
-                    font = ImageFont.truetype(font_path, font_size)
-                except OSError:
-                    font = ImageFont.load_default()
+                    current_font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=font_size)
+                except Exception:
+                    current_font = ImageFont.load_default()
                     break
-                lines = wrap_text_to_width(text, font, w)
                 continue
-            else:
+
+            # If shrink didn't help (font at min size) but still doesn't fit, expand box
+            if lines and (max(line_widths) > w0 or total_height > h0):
+                # Expand to accommodate width and height
+                new_w = max(w0, max(line_widths))
+                new_h = max(h0, total_height)
+
+                # Clamp to image boundaries
+                w0 = min(new_w, img_w - x0)
+                h0 = min(new_h, img_h - y0)
+
+                # After expansion, re-wrap because box width changed
+                lines = wrap_text_to_width(translation, current_font, w0)
+                # Recalculate sizes
+                line_widths = []
+                line_heights = []
+                total_height = 0
+                for line in lines:
+                    lw, lh = measure_text(line, current_font)
+                    line_widths.append(lw)
+                    line_heights.append(lh)
+                    total_height += lh
+                total_height += max(0, (len(lines) - 1) * 4)
+                # If still doesn't fit in height, clamp height and break
+                if total_height > (img_h - y0):
+                    h0 = img_h - y0
                 break
 
-        # 3d) Recompute total height and expand box downward if needed
-        ascent, descent = font.getmetrics()
-        line_height = ascent + descent
-        total_text_height = line_height * len(lines)
-        if total_text_height > h:
-            new_h = total_text_height
-            if y + new_h > img_h:
-                new_h = img_h - y
-            h = new_h
+            # Everything fits, break
+            break
 
-        # 3e) Build final multiline text
-        text_block = "\n".join(lines)
-        text_bbox = draw.multiline_textbbox((x, y), text_block, font=font)
-        tb_left, tb_top, tb_right, tb_bottom = text_bbox
+        # 3c) Compute vertical offset to center lines within the final box height
+        total_height = sum(line_heights) + max(0, (len(lines) - 1) * 4)
+        y_offset = y0 + max(0, (h0 - total_height) // 2)
 
-        # 3f) Draw white background rectangle (with 4px padding)
-        padding = 4
-        rect_left = max(tb_left - padding, 0)
-        rect_top = max(tb_top - padding, 0)
-        rect_right = min(tb_right + padding, img_w)
-        rect_bottom = min(tb_bottom + padding, img_h)
-        draw.rectangle([rect_left, rect_top, rect_right, rect_bottom], fill='white')
+        # 3d) Draw each line centered horizontally in the box
+        for idx, line in enumerate(lines):
+            lw, lh = measure_text(line, current_font)
+            text_x = x0 + max(0, (w0 - lw) // 2)
+            draw.text((text_x, y_offset), line, fill="black", font=current_font)
+            y_offset += lh + 4  # 4px line spacing
 
-        # 3g) Finally draw the text in black
-        draw.multiline_text((x, y), text_block, fill='black', font=font)
-
-    # 4) Return PNG in memory
-    buf = BytesIO()
-    image.save(buf, format='PNG')
-    buf.seek(0)
-    return send_file(buf, mimetype='image/png')
+    # 4) Save to a temp file and return as JPEG
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    image.save(tmp.name, format="JPEG")
+    tmp.seek(0)
+    return send_file(tmp.name, mimetype="image/jpeg")
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
